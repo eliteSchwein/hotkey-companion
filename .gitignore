@@ -1,0 +1,6 @@
+out
+.idea
+*.so
+*.pyc
+.config
+.config.old
