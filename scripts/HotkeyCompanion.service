@@ -1,0 +1,15 @@
+[Unit]
+Description=Hotkey Companion
+StartLimitIntervalSec=0
+After=moonraker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+User=HC_USER
+WorkingDirectory=HC_DIR
+ExecStart="HC_ENV/bin/python HC_DIR/companion/companion.py MC_CONFIG_PATH MC_LOG_PATH"
+
+[Install]
+WantedBy=multi-user.target
