@@ -47,6 +47,14 @@ void Led::setLed(uint8_t index, uint32_t color)
 {
   if (index >= NUM_LEDS) return;
   leds[index] = color;
+
+  if constexpr (LEDS_PER_BUTTON > 1)
+  {
+    for (uint8_t i = 0; i < LEDS_PER_BUTTON; i++)
+    {
+      leds[index + i] = color;
+    }
+  }
   FastLED.show();
 }
 
