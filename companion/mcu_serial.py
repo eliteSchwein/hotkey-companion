@@ -18,7 +18,6 @@ PressCallback = Callable[[str, int, str], None]
 
 
 def _norm_color(color: Color) -> str:
-    """Return uppercase RRGGBB."""
     if isinstance(color, int):
         if color < 0 or color > 0xFFFFFF:
             raise ValueError(f"Color int out of range: {color}")
@@ -81,12 +80,11 @@ class McuConnection:
         with self._lock:
             if self._ser is not None and self._ser.is_open:
                 return
-
             self._ser = serial.Serial(
                 port=self.spec.port,
                 baudrate=self.spec.baudrate,
-                timeout=0,        # non-blocking read
-                write_timeout=0,  # non-blocking write
+                timeout=0,
+                write_timeout=0,
             )
 
         self._stop.clear()
@@ -127,13 +125,11 @@ class McuConnection:
         if button_id < 0 or button_id > 255:
             raise ValueError("button_id must be 0..255")
         c = _norm_color(color)
-        # IMPORTANT: your firmware expects SET_SINGLE
         self.send_line(f"SET_SINGLE B={button_id} C={c}")
         self._log(f"colorSingle -> B={button_id} C={c}")
 
     def _worker(self) -> None:
         idle_sleep = 0.005
-
         while not self._stop.is_set():
             with self._lock:
                 ser = self._ser
@@ -190,14 +186,10 @@ class McuConnection:
 
 
 class MultiMcuSerial:
-    """
-    - configure_static_from_config(cfg): remembers base + static buttons
-    - connect(): connects and after delay applies base then static overrides
-    """
-
     def __init__(self, press_cb: Optional[PressCallback] = None, startup_delay: float = 0.6):
         self._press_cb = press_cb
         self._mcus: Dict[str, McuConnection] = {}
+
         self._startup_all: Dict[str, str] = {}
         self._static_buttons: Dict[str, List[Tuple[int, str]]] = {}
         self._startup_delay = float(startup_delay)
@@ -211,10 +203,11 @@ class MultiMcuSerial:
         self._startup_all.clear()
         self._static_buttons.clear()
 
-        for mcu_name, mcu_cfg in cfg.mcus.items():
-            col = getattr(mcu_cfg, "color_all", None)
-            if col:
-                self._startup_all[mcu_name] = _norm_color(col)
+        if hasattr(cfg, "mcus"):
+            for mcu_name, mcu_cfg in cfg.mcus.items():
+                col = getattr(mcu_cfg, "color_all", None)
+                if col:
+                    self._startup_all[mcu_name] = _norm_color(col)
 
         for b in cfg.buttons.values():
             if str(getattr(b, "led_state", "")).lower() != "static":
@@ -222,9 +215,9 @@ class MultiMcuSerial:
             col = getattr(b, "led_color", None)
             if not col:
                 continue
-            mcu = getattr(b, "mcu")
+            mcu_name = getattr(b, "mcu")
             bid = int(getattr(b, "button_id"))
-            self._static_buttons.setdefault(mcu, []).append((bid, _norm_color(col)))
+            self._static_buttons.setdefault(mcu_name, []).append((bid, _norm_color(col)))
 
     def _apply_startup_for_mcu(self, mcu_name: str) -> None:
         conn = self._mcus.get(mcu_name)
