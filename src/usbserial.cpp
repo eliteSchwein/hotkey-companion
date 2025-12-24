@@ -1,94 +1,137 @@
-//
-// Created by tludwig on 12/12/25.
-//
-
 #include "usbserial.h"
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 
 #ifndef SERIAL_BAUDRATE
   #define SERIAL_BAUDRATE 250000
 #endif
 
-void UsbSerial::begin(uint32_t waitMs, bool ignoreFlowControl) {
+#if defined(ARDUINO_ARCH_RP2040)
+  #include "tusb.h"
+#endif
+
+void UsbSerial::resetRx_() {
+  lineLen_ = 0;
+  lineReady_ = false;
+  lineBuf_[0] = '\0';
+}
+
+bool UsbSerial::cdcOpenNow_() {
+#if defined(ARDUINO_ARCH_RP2040)
+  // true when host has opened the CDC port (DTR)
+  return tud_cdc_connected();
+#else
+  return Serial.dtr();
+#endif
+}
+
+void UsbSerial::begin() {
   Serial.begin(SERIAL_BAUDRATE);
+  Serial.ignoreFlowControl(true); // avoid blocking writes
 
-  if (ignoreFlowControl) {
-    Serial.ignoreFlowControl(true);
+  resetRx_();
+
+  cdcOpen_ = cdcOpenNow_();
+  connectFired_ = false;
+
+  // If already open (rare), fire immediately
+  if (cdcOpen_ && onConnect_) {
+    connectFired_ = true;
+    onConnect_();
   }
-
-  if (waitMs) {
-    uint32_t t0 = millis();
-    while (!Serial && (millis() - t0) < waitMs) delay(10);
-  }
-
-  lastDtr_ = Serial.dtr();
-  connected_ = lastDtr_;
 }
 
-void UsbSerial::printf(const char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  Serial.printf(fmt, ap);
-  va_end(ap);
-}
-
-size_t UsbSerial::readBytes(uint8_t* buf, size_t maxLen) {
-  size_t n = 0;
-  while (n < maxLen && Serial.available()) {
-    int c = Serial.read();
-    if (c < 0) break;
-    buf[n++] = (uint8_t)c;
-  }
-  return n;
+void UsbSerial::close() {
+  cdcOpen_ = false;
+  connectFired_ = false;
+  resetRx_();
+  Serial.end();
 }
 
 void UsbSerial::tick() {
-  // Detect connect/disconnect via DTR state. :contentReference[oaicite:5]{index=5}
-  bool dtr = Serial.dtr();
-  if (dtr != lastDtr_) {
-    lastDtr_ = dtr;
-    connected_ = dtr;
+#if defined(ARDUINO_ARCH_RP2040)
+  // If USB isn't even mounted, don't touch Serial I/O
+  if (!tud_mounted()) return;
+#endif
 
-    if (connected_) {
-      if (onConnect_) onConnect_();
-    } else {
-      if (onDisconnect_) onDisconnect_();
-    }
+  bool nowOpen = cdcOpenNow_();
+
+  // Fire onConnect once each time the terminal opens
+  if (nowOpen && !connectFired_) {
+    connectFired_ = true;
+    if (onConnect_) onConnect_();
   }
 
-  // Read incoming data into a line buffer
+  // If terminal closed, allow firing again next open and drop partial RX
+  if (!nowOpen && cdcOpen_) {
+    connectFired_ = false;
+    resetRx_();
+  }
+  cdcOpen_ = nowOpen;
+
+  // Non-blocking RX line accumulation
   while (Serial.available() && !lineReady_) {
     int ci = Serial.read();
     if (ci < 0) break;
     char c = (char)ci;
 
-    if (c == '\r') continue; // ignore CR
-    if (c == '\n') {
-      // end of line
+    // EOL on CR or LF; swallow LF after CR (CRLF)
+    if (c == '\r' || c == '\n') {
       lineBuf_[lineLen_] = '\0';
       lineReady_ = true;
+
+      if (c == '\r' && Serial.available() && Serial.peek() == '\n') {
+        (void)Serial.read();
+      }
       break;
     }
 
     if (lineLen_ + 1 < LINE_BUF_SIZE) {
       lineBuf_[lineLen_++] = c;
     } else {
-      lineLen_ = 0;
+      resetRx_(); // overflow -> drop line
     }
   }
 }
 
 bool UsbSerial::readLine(char* out, size_t outSize) {
   if (!lineReady_) return false;
+  if (!out || outSize == 0) return false;
 
-  // copy out
   size_t n = strnlen(lineBuf_, LINE_BUF_SIZE);
-  if (outSize == 0) return false;
   if (n >= outSize) n = outSize - 1;
+
   memcpy(out, lineBuf_, n);
   out[n] = '\0';
 
-  // reset for next line
-  lineLen_ = 0;
-  lineReady_ = false;
+  resetRx_();
   return true;
+}
+
+void UsbSerial::println(const char* s) {
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!tud_mounted()) return;
+#endif
+  Serial.println(s);
+}
+
+void UsbSerial::println() {
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!tud_mounted()) return;
+#endif
+  Serial.println();
+}
+
+void UsbSerial::printf(const char* fmt, ...) {
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!tud_mounted()) return;
+#endif
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
 }

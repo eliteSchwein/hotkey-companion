@@ -1,48 +1,36 @@
-//
-// Created by tludwig on 12/12/25.
-//
-
 #pragma once
 #include <Arduino.h>
+#include <cstddef>
 
-class UsbSerial
-{
+class UsbSerial {
 public:
-    void begin(uint32_t waitMs = 0, bool ignoreFlowControl = false);
+    using Callback = void (*)();
 
-    // Callbacks (optional)
-    void onConnect(void (*cb)())    { onConnect_ = cb; }
-    void onDisconnect(void (*cb)()) { onDisconnect_ = cb; }
+    void begin();   // non-blocking
+    void close();   // non-blocking
 
-    // Call this often (e.g. every loop) to update connection state + buffer input
-    void tick();
+    void onConnect(Callback cb) { onConnect_ = cb; }
 
-    bool connected() const { return connected_; }
+    void tick(); // non-blocking
 
-    // Sending
-    size_t send(const char* s) { return Serial.print(s); }
-    void println(const char* s) { Serial.println(s); }
-    void printf(const char* fmt, ...);
+    bool readLine(char* out, size_t outSize); // non-blocking, CR/LF/CRLF
 
-    // Reading (raw)
-    int available() { return Serial.available(); }
-    int read() { return Serial.read(); }
-    size_t readBytes(uint8_t* buf, size_t maxLen);
-
-    // Reading (line-based, non-blocking)
-    // Returns true when a full line is available in out (without \r/\n)
-    bool readLine(char* out, size_t outSize);
+    static void println(const char* s);
+    static void println();
+    static void printf(const char* fmt, ...);
 
 private:
     static constexpr size_t LINE_BUF_SIZE = 128;
 
-    bool connected_ = false;
-    bool lastDtr_ = false;
+    Callback onConnect_ = nullptr;
+
+    bool cdcOpen_ = false;      // terminal open (DTR)
+    bool connectFired_ = false; // fire onConnect once per open
 
     char lineBuf_[LINE_BUF_SIZE]{};
     size_t lineLen_ = 0;
     bool lineReady_ = false;
 
-    void (*onConnect_)() = nullptr;
-    void (*onDisconnect_)() = nullptr;
+    void resetRx_();
+    static bool cdcOpenNow_() ;
 };

@@ -2,6 +2,7 @@
 #include <cstring>
 #include <strings.h>
 
+#include "bootloader.h"
 #include "led.h"
 #include "usbserial.h"
 
@@ -20,73 +21,191 @@
 inline constexpr uint8_t HOTKEY_BUTTON_PINS[] = { HOTKEY_BUTTON_PINS_MAP };
 
 Led led;
-UsbSerial usbSerial;
+extern UsbSerial usbSerial;
+Bootloader bootloader;
 
 static constexpr uint32_t DEBOUNCE_MS = 20;
 static bool stablePressed[HOTKEY_BUTTONS]{};
 static bool lastRaw[HOTKEY_BUTTONS]{};
 static uint32_t lastChange[HOTKEY_BUTTONS]{};
 
-bool handleLedCommand(char *line)
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
+#define STRVA_HELPER(...) #__VA_ARGS__
+#define STRVA(...) STRVA_HELPER(__VA_ARGS__)
+
+static void printConfig()
 {
-  char *cmd = strtok(line, " \t");
-  if (!cmd) return false;
+  UsbSerial::println("=== CONFIG ===");
+  
+  // Core settings
+  UsbSerial::printf("SERIAL_BAUDRATE=%s\n", STR(SERIAL_BAUDRATE));
+  UsbSerial::printf("BRIGHTNESS=%s\n", STR(BRIGHTNESS));
+  UsbSerial::printf("HOTKEY_BUTTONS=%s\n", STR(HOTKEY_BUTTONS));
 
-  if (strcasecmp(cmd, "LED") != 0) return false;
+  // Boot key
+#if BOOT_KEY_PIN >= 0
+  UsbSerial::printf("BOOT_KEY_PIN=%s\n", STR(BOOT_KEY_PIN));
+#else
+  usbSerial.println("BOOT_KEY_PIN=<disabled>");
+#endif
+  UsbSerial::printf("BOOT_KEY_ACTIVE_LOW=%s\n", STR(BOOT_KEY_ACTIVE_LOW));
+  UsbSerial::printf("BOOT_DBL_MS=%s\n", STR(BOOT_DBL_MS));
 
-  char *idStr = strtok(nullptr, " \t");
-  char *colStr = strtok(nullptr, " \t");
-  if (!idStr || !colStr) return false;
+  // LED-related (only if defined)
+#ifdef LED_PIN
+  UsbSerial::printf("LED_PIN=%s\n", STR(LED_PIN));
+#else
+  usbSerial.println("LED_PIN=<not defined>");
+#endif
 
-  if (strtok(nullptr, " \t") != nullptr) return false;
+#ifdef LEDS_PER_BUTTON
+  UsbSerial::printf("LEDS_PER_BUTTON=%s\n", STR(LEDS_PER_BUTTON));
+#else
+  usbSerial.println("LEDS_PER_BUTTON=<not defined>");
+#endif
 
-  char *end1 = nullptr;
-  long id = strtol(idStr, &end1, 10);
-  if (!end1 || *end1 != '\0' || id < 0 || id > 255) return false;
+  // Button pin map (macro text + resolved values)
+  UsbSerial::printf("HOTKEY_BUTTON_PINS_MAP=%s\n", STRVA(HOTKEY_BUTTON_PINS_MAP));
 
-  if (colStr[0] == '0' && (colStr[1] == 'x' || colStr[1] == 'X')) colStr += 2;
+  UsbSerial::println("HOTKEY_BUTTON_PINS=[");
+  for (uint8_t i = 0; i < HOTKEY_BUTTONS; i++) {
+    UsbSerial::printf("%u", (unsigned)HOTKEY_BUTTON_PINS[i]);
+    if (i + 1 < HOTKEY_BUTTONS) UsbSerial::println(",");
+  }
+  UsbSerial::println("]");
+}
 
-  char *end2 = nullptr;
-  unsigned long rgb = strtoul(colStr, &end2, 16);
-  if (!end2 || *end2 != '\0') return false;
-
-  uint32_t color = (uint32_t)rgb & 0x00FFFFFFu;
-
-  led.setLed((uint8_t)id, color);
+static bool parseKeyVal(const char* tok, const char* key, const char** valOut) {
+  size_t klen = strlen(key);
+  if (strncasecmp(tok, key, klen) != 0) return false;
+  if (tok[klen] != '=') return false;
+  *valOut = tok + klen + 1;
   return true;
 }
 
-void onDisconnect()
+static bool parseU8Dec(const char* s, uint8_t* out) {
+  if (!s || !*s) return false;
+  char* end = nullptr;
+  long v = strtol(s, &end, 10);
+  if (!end || *end != '\0') return false;
+  if (v < 0 || v > 255) return false;
+  *out = (uint8_t)v;
+  return true;
+}
+
+static bool parseColor24(const char* s, uint32_t* out) {
+  if (!s || !*s) return false;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+
+  char* end = nullptr;
+  unsigned long v = strtoul(s, &end, 16);
+  if (!end || *end != '\0') return false;
+  *out = (uint32_t)v & 0x00FFFFFFu;
+  return true;
+}
+
+
+enum class CmdResult : uint8_t { Unknown, Ok, Err };
+
+CmdResult handleCommand(char *line)
 {
-  led.setAllLed(CRGB::Black);
-  led.setBrightness(BRIGHTNESS);
+  char *cmd = strtok(line, " \t");
+  if (!cmd) return CmdResult::Err;
+
+  if (strcasecmp(cmd, "BOOT_BOOTLOADER") == 0) {
+    if (strtok(nullptr, " \t") != nullptr) return CmdResult::Err;
+    UsbSerial::println("Rebooting to bootloader...");
+    delay(50);
+    bootloader.loadBootloader();
+    return CmdResult::Ok; // (won't return on RP2040, but fine)
+  }
+
+  if (strcasecmp(cmd, "CONFIG") == 0) {
+    if (strtok(nullptr, " \t") != nullptr) return CmdResult::Err;
+    printConfig();                 // implement as discussed earlier
+    return CmdResult::Ok;
+  }
+
+  if (strcasecmp(cmd, "SET_SINGLE") == 0) {
+    const char* bVal = nullptr;
+    const char* cVal = nullptr;
+
+    for (char* tok = strtok(nullptr, " \t"); tok; tok = strtok(nullptr, " \t")) {
+      const char* v = nullptr;
+      if (parseKeyVal(tok, "B", &v)) { bVal = v; continue; }
+      if (parseKeyVal(tok, "C", &v)) { cVal = v; continue; }
+      return CmdResult::Err; // unknown token
+    }
+
+    uint8_t id;
+    uint32_t color;
+    if (!bVal || !cVal) return CmdResult::Err;
+    if (!parseU8Dec(bVal, &id)) return CmdResult::Err;
+    if (!parseColor24(cVal, &color)) return CmdResult::Err;
+
+    Led::setLed(id, color);      // button index -> lights LEDS_PER_BUTTON block
+    return CmdResult::Ok;
+  }
+
+  // --- SET_ALL C=<hex> ---
+  if (strcasecmp(cmd, "SET_ALL") == 0) {
+    const char* cVal = nullptr;
+
+    for (char* tok = strtok(nullptr, " \t"); tok; tok = strtok(nullptr, " \t")) {
+      const char* v = nullptr;
+      if (parseKeyVal(tok, "C", &v)) { cVal = v; continue; }
+      return CmdResult::Err;
+    }
+
+    uint32_t color;
+    if (!cVal) return CmdResult::Err;
+    if (!parseColor24(cVal, &color)) return CmdResult::Err;
+
+    Led::setAllLed(color);
+    return CmdResult::Ok;
+  }
+
+  return CmdResult::Unknown;
 }
 
 void onConnect()
 {
-  usbSerial.println("Connected");
+  UsbSerial::println("Hotkey Companion Firmware V0.0.1");
+  Led::setAllLed(CRGB::Black);
+  Led::setBrightness(BRIGHTNESS);
 }
 
 void setup() {
-  led.init();
+  bootloader.init();
+  Led::init();
 
-  for (uint8_t i = 0; i < HOTKEY_BUTTONS; i++)
+  for (unsigned char i : HOTKEY_BUTTON_PINS)
   {
-    pinMode(HOTKEY_BUTTON_PINS[i], INPUT_PULLUP);
+    pinMode(i, INPUT_PULLUP);
   }
 
-  usbSerial.onDisconnect(onDisconnect);
   usbSerial.onConnect(onConnect);
-  usbSerial.begin(1500, true);
+  usbSerial.begin();
 }
 
 void loop() {
+  delay(10);
+  bootloader.check();
   usbSerial.tick();
 
   char line[128];
   if (usbSerial.readLine(line, sizeof(line)))
   {
-    handleLedCommand(line);
+    handleCommand(line);
+  }
+
+  if (usbSerial.readLine(line, sizeof(line))) {
+    CmdResult r = handleCommand(line);
+    if (r == CmdResult::Ok) UsbSerial::println("OK");
+    else if (r == CmdResult::Err) UsbSerial::println("ERR");
+    else UsbSerial::println("UNKNOWN");
   }
 
   uint32_t now = millis();
@@ -105,8 +224,8 @@ void loop() {
 
       if (stablePressed[i])
       {
-        led.setLed(i, CRGB::Yellow);
-        usbSerial.printf("pressed %s\n", i+1);
+        //Led::setLed(i, CRGB::Yellow);
+        UsbSerial::printf("pressed %u\n", i);
       }
     }
   }

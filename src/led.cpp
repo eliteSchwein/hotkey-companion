@@ -3,9 +3,9 @@
 //
 
 #include "led.h"
-#include <cstdint>
 
 #include "FastLED.h"
+#include "usbserial.h"
 
 #ifndef LED_PIN
   #define LED_PIN 29
@@ -31,7 +31,7 @@ CRGB leds[NUM_LEDS];
 
 void Led::init()
 {
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
+  CFastLED::addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
     .setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
   setAllLed(CRGB::Yellow);
@@ -43,18 +43,16 @@ void Led::setBrightness(fl::u8 brightness)
   FastLED.show();
 }
 
-void Led::setLed(uint8_t index, uint32_t color)
+void Led::setLed(uint8_t buttonIndex, uint32_t color)
 {
-  if (index >= NUM_LEDS) return;
-  leds[index] = color;
+  const uint16_t base = (uint16_t)buttonIndex * (uint16_t)LEDS_PER_BUTTON;
+  if (base >= NUM_LEDS) return;
 
-  if constexpr (LEDS_PER_BUTTON > 1)
-  {
-    for (uint8_t i = 0; i < LEDS_PER_BUTTON; i++)
-    {
-      leds[index + i] = color;
-    }
+  for (uint8_t i = 0; i < LEDS_PER_BUTTON; i++) {
+    const uint16_t ledIndex = base + i;
+    if (ledIndex < NUM_LEDS) leds[ledIndex] = (CRGB)color;
   }
+
   FastLED.show();
 }
 

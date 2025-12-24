@@ -8,8 +8,8 @@
 
 class Led{
 public:
-  void init();
-  void setBrightness(fl::u8 brightness);
-  void setLed(uint8_t led, uint32_t color);
-  void setAllLed(uint32_t color);
+  static void init();
+  static void setBrightness(fl::u8 brightness);
+  static void setLed(uint8_t led, uint32_t color);
+  static void setAllLed(uint32_t color);
 };
