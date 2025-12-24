@@ -1,5 +1,6 @@
 --find-links=python_wheels
 pyserial==3.4
+pyserial==3.4
 
 # Compatibility for Python 3.8 (EOL)
 websocket-client==1.8.0;python_version=="3.8"
