@@ -7,8 +7,7 @@ set -e
 SCRIPTPATH=$(dirname -- "$(readlink -f -- "$0")")
 HCPATH=$(dirname "$SCRIPTPATH")
 HCENV="${HOTKEYCOMPANION_VENV:-${HOME}/.HotkeyCompanion-env}"
-HCCONFIGPATH="/home/$(whoami)/printer_data/config"
-HCLOGPATH="/home/$(whoami)/printer_data/logs"
+HCCONFIGPATH="/home/$(whoami)/printer_data/config/hotkey-companion.cfg"
 
 PACKAGES="python3-venv python3-dev"
 
@@ -146,6 +145,29 @@ create_virtualenv()
     ok_msg "Virtual environment created"
 }
 
+copy_config_if_missing() {
+    local SRC_CFG="${SCRIPTPATH}/hotkey-companion.cfg"
+
+    status_msg "Checking Hotkey Companion config"
+
+    if [ -f "${HCCONFIGPATH}" ]; then
+        ok_msg "Config already exists at ${HCCONFIGPATH} (skipping copy)"
+        return 0
+    fi
+
+    if [ ! -f "${SRC_CFG}" ]; then
+        warn_msg "Config not found next to script: ${SRC_CFG}"
+        exit 1
+    fi
+
+    status_msg "Copying default config to ${HCCONFIGPATH}"
+    sudo mkdir -p "$(dirname "${HCCONFIGPATH}")"
+    sudo cp -n "${SRC_CFG}" "${HCCONFIGPATH}"
+    sudo chown "${USER}:${USER}" "${HCCONFIGPATH}" 2>/dev/null || true
+    ok_msg "Config copied to ${HCCONFIGPATH}"
+}
+
+
 install_systemd_service()
 {
     status_msg "Installing Hotkey Companion unit file"
@@ -155,7 +177,6 @@ install_systemd_service()
     SERVICE=${SERVICE//HC_ENV/$HCENV}
     SERVICE=${SERVICE//HC_DIR/$HCPATH}
     SERVICE=${SERVICE//HC_CONFIG_PATH/$HCCONFIGPATH}
-    SERVICE=${SERVICE//HC_LOG_PATH/$HCLOGPATH}
 
     echo "$SERVICE" | sudo tee /etc/systemd/system/HotkeyCompanion.service > /dev/null
     sudo systemctl unmask HotkeyCompanion.service
@@ -180,5 +201,6 @@ check_requirements
 
 install_packages
 create_virtualenv
+copy_config_if_missing
 install_systemd_service
 start_HotkeyCompanion
