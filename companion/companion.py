@@ -102,7 +102,7 @@ def build_subscribe_objects(cfg: HotkeyConfig, objects_list: List[str]) -> Dict[
                     break
 
         if st == "heater":
-            heater = str(_get_attr(b, "led_heater", "led_header") or "").strip()
+            heater = str(_get_attr(b, "led_heater") or "").strip()
             if not heater:
                 continue
             real = pick(heater.lower())
