@@ -47,9 +47,6 @@ def build_button_index(cfg: HotkeyConfig) -> Dict[str, Dict[int, List[Any]]]:
 
 
 def build_subscribe_objects(cfg: HotkeyConfig, objects_list: List[str]) -> Dict[str, Any]:
-    """
-    Build a minimal subscription set based on configured dynamic buttons.
-    """
     objset = {o.lower(): o for o in objects_list}
 
     def pick(name: str) -> Optional[str]:
@@ -57,11 +54,7 @@ def build_subscribe_objects(cfg: HotkeyConfig, objects_list: List[str]) -> Dict[
 
     want: Dict[str, Any] = {}
 
-    # Always useful
-    wh = pick("webhooks")
-    if wh:
-        want[wh] = ["state", "state_message"]
-
+    # baseline for common states
     th = pick("toolhead")
     if th:
         want[th] = ["position", "homed_axes"]
@@ -80,44 +73,31 @@ def build_subscribe_objects(cfg: HotkeyConfig, objects_list: List[str]) -> Dict[
             # already covered by toolhead
             continue
 
-        if st == "output":
-            name = str(_get_attr(b, "led_output") or "").strip()
-            if not name:
-                continue
-            key = f"output_pin {name.lower()}"
-            real = pick(key)
-            if real:
-                want[real] = ["value"]
+        if st == "printing":
+            # already covered by print_stats
+            continue
+
+        if st == "heater":
+            # actual heater objects are like "heater_bed", "extruder"
+            name = str(_get_attr(b, "led_heater") or "").strip()
+            if name:
+                real = pick(name)
+                if real:
+                    want[real] = ["temperature", "target"]
 
         if st == "fan":
             name = str(_get_attr(b, "led_fan") or "").strip()
-            if not name:
-                continue
-            # try typical fan object types
-            for prefix in ("fan_generic", "heater_fan", "controller_fan", "fan"):
-                key = f"{prefix} {name.lower()}"
-                real = pick(key)
+            if name:
+                real = pick(name)
                 if real:
-                    want[real] = None
-                    break
+                    want[real] = ["speed"]
 
-        if st == "heater":
-            heater = str(_get_attr(b, "led_heater") or "").strip()
-            if not heater:
-                continue
-            real = pick(heater.lower())
-            if real:
-                want[real] = None
-
-        if st == "z_tilt":
-            real = pick("z_tilt")
-            if real:
-                want[real] = None
-
-        if st in ("qgl", "quad_gantry_level"):
-            real = pick("quad_gantry_level")
-            if real:
-                want[real] = None
+        if st == "output":
+            name = str(_get_attr(b, "led_output") or "").strip()
+            if name:
+                real = pick(name)
+                if real:
+                    want[real] = None  # subscribe whole object
 
         if st == "bed_mesh":
             real = pick("bed_mesh")
@@ -138,6 +118,8 @@ class LedEngine:
         self.bus = bus
         self.button_index = button_index
 
+        self._lock = threading.RLock()
+
         self._objects_map: Dict[str, str] = {}  # lower -> real
         self.state: Dict[str, Dict[str, Any]] = {}  # real_object -> fields dict
 
@@ -147,49 +129,54 @@ class LedEngine:
         self._last_sent: Dict[Tuple[str, int], str] = {}
 
     def set_objects_list(self, objects: List[str]) -> None:
-        self._objects_map = {o.lower(): o for o in objects}
+        with self._lock:
+            self._objects_map = {o.lower(): o for o in objects}
 
     def _find_obj(self, key: str) -> Optional[str]:
-        return self._objects_map.get(key.lower())
+        with self._lock:
+            return self._objects_map.get(key.lower())
 
     def press_busy(self, mcu: str, bid: int, hold_s: float = 0.8) -> None:
-        btns = self.button_index.get(mcu, {}).get(bid, [])
-        mcu_cfg = self.cfg.mcus.get(mcu)
-        base_busy = _norm_color(getattr(mcu_cfg, "color_busy", "")) if mcu_cfg else ""
-        col = ""
+        with self._lock:
+            btns = self.button_index.get(mcu, {}).get(bid, [])
+            mcu_cfg = self.cfg.mcus.get(mcu)
+            base_busy = _norm_color(getattr(mcu_cfg, "color_busy", "")) if mcu_cfg else ""
+            col = ""
 
-        if btns:
-            b = btns[0]
-            col = _norm_color(_get_attr(b, "led_busy_color")) or ""
+            if btns:
+                b = btns[0]
+                col = _norm_color(_get_attr(b, "led_busy_color")) or ""
 
-        if not col:
-            col = base_busy or "000000"
+            if not col:
+                col = base_busy or "000000"
 
-        self._busy_until[(mcu, bid)] = time.monotonic() + float(hold_s)
-        self._busy_color[(mcu, bid)] = col
-        self._set(mcu, bid, col, reason=f"BUSY hold={hold_s}s")
+            self._busy_until[(mcu, bid)] = time.monotonic() + float(hold_s)
+            self._busy_color[(mcu, bid)] = col
+            self._set(mcu, bid, col, reason=f"BUSY hold={hold_s}s")
 
     def tick(self) -> None:
-        now = time.monotonic()
-        expired = [k for k, t in self._busy_until.items() if now >= t]
-        for k in expired:
-            self._busy_until.pop(k, None)
-            self._busy_color.pop(k, None)
-            mcu, bid = k
-            self._revert_after_busy(mcu, bid)
+        with self._lock:
+            now = time.monotonic()
+            expired = [k for k, t in self._busy_until.items() if now >= t]
+            for k in expired:
+                self._busy_until.pop(k, None)
+                self._busy_color.pop(k, None)
+                mcu, bid = k
+                self._revert_after_busy(mcu, bid)
 
     def _set(self, mcu: str, bid: int, color: str, reason: str = "") -> None:
-        if not color:
-            return
-        key = (mcu, bid)
-        if self._last_sent.get(key) == color:
-            return
-        self._last_sent[key] = color
-        if reason:
-            print(f"[led] mcu={mcu} bid={bid} -> {color} ({reason})", flush=True)
-        else:
-            print(f"[led] mcu={mcu} bid={bid} -> {color}", flush=True)
-        self.bus.colorSingle(mcu, bid, color)
+        with self._lock:
+            if not color:
+                return
+            key = (mcu, bid)
+            if self._last_sent.get(key) == color:
+                return
+            self._last_sent[key] = color
+            if reason:
+                print(f"[led] mcu={mcu} bid={bid} -> {color} ({reason})", flush=True)
+            else:
+                print(f"[led] mcu={mcu} bid={bid} -> {color}", flush=True)
+            self.bus.colorSingle(mcu, bid, color)
 
     def _desired_for_button(self, b: Any) -> str:
         mcu_cfg = self.cfg.mcus.get(b.mcu)
@@ -204,139 +191,61 @@ class LedEngine:
         active = _norm_color(_get_attr(b, "led_active_color", "active_color")) or base
         inactive = _norm_color(_get_attr(b, "led_inactive_color", "inactive_color")) or base
 
-        # HOMED (uses toolhead)
         if st == "homed":
             axis = str(_get_attr(b, "led_axis") or "x").lower().strip()
-            toolhead = self._find_obj("toolhead") or "toolhead"
-            th = self.state.get(toolhead, {}) or {}
+            key = self._find_obj("toolhead") or "toolhead"
+            th = self.state.get(key, {}) or {}
 
             homed_axes = str(th.get("homed_axes") or "").lower()
-            pos = th.get("position")
-            x = y = z = 0.0
-            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                try:
-                    x = float(pos[0]); y = float(pos[1]); z = float(pos[2])
-                except Exception:
-                    pass
-
-            # busy if axis position goes negative (your observation)
-            busy = False
-            if axis in ("x", "y", "z"):
-                val = {"x": x, "y": y, "z": z}[axis]
-                busy = (val < 0.0)
-            elif axis == "all":
-                busy = (x < 0.0) or (y < 0.0) or (z < 0.0)
-
-            if busy:
-                busy_col = _norm_color(_get_attr(b, "led_busy_color")) or _norm_color(getattr(mcu_cfg, "color_busy", "")) or inactive
-                return busy_col
-
-            if axis == "all":
-                ok = ("x" in homed_axes) and ("y" in homed_axes) and ("z" in homed_axes)
-            else:
-                ok = (axis in homed_axes)
-
+            ok = axis in homed_axes
             return active if ok else inactive
 
-        # OUTPUT (output_pin <name>.value)
-        if st == "output":
-            name = str(_get_attr(b, "led_output") or "").strip()
-            thr = _get_attr(b, "led_threshould", "led_threshold")
-            try:
-                thr_f = float(thr) if thr is not None else 0.5
-            except Exception:
-                thr_f = 0.5
-
-            key = self._find_obj(f"output_pin {name.lower()}") or f"output_pin {name.lower()}"
+        if st == "printing":
+            key = self._find_obj("print_stats") or "print_stats"
             obj = self.state.get(key, {}) or {}
-            val = obj.get("value", None)
+            state = str(obj.get("state") or "").lower()
+            ok = state in ("printing", "paused")
+            return active if ok else inactive
+
+        if st == "heater":
+            name = str(_get_attr(b, "led_heater") or "").strip()
+            if not name:
+                return inactive
+            key = self._find_obj(name) or name
+            obj = self.state.get(key, {}) or {}
             try:
-                v = float(val) if val is not None else 0.0
+                tgt = float(obj.get("target") or 0.0)
             except Exception:
-                v = 0.0
+                tgt = 0.0
+            ok = tgt > 0.0
+            return active if ok else inactive
 
-            is_active = v > thr_f
-            print(f"[thr] output {name} value={v} thr={thr_f} -> active={is_active}", flush=True)
-            return active if is_active else inactive
-
-        # FAN (speed)
         if st == "fan":
             name = str(_get_attr(b, "led_fan") or "").strip()
-            thr = _get_attr(b, "led_threshould", "led_threshold")
-            try:
-                thr_f = float(thr) if thr is not None else 0.5
-            except Exception:
-                thr_f = 0.5
-
-            # try common object names
-            obj = None
-            objname = None
-            for prefix in ("fan_generic", "heater_fan", "controller_fan", "fan"):
-                key = self._find_obj(f"{prefix} {name.lower()}")
-                if key and key in self.state:
-                    objname = key
-                    obj = self.state.get(key, {})
-                    break
-
-            if not obj:
-                print(f"[thr] fan {name} missing -> inactive", flush=True)
+            if not name:
                 return inactive
-
-            # try speed fields
-            v = None
-            for fld in ("speed", "value", "fan_speed"):
-                if fld in obj:
-                    v = obj.get(fld)
-                    break
-            try:
-                v_f = float(v) if v is not None else 0.0
-            except Exception:
-                v_f = 0.0
-
-            is_active = v_f > thr_f
-            print(f"[thr] fan {name} obj={objname} v={v_f} thr={thr_f} -> active={is_active}", flush=True)
-            return active if is_active else inactive
-
-        # HEATER (power preferred, else temperature)
-        if st == "heater":
-            heater = str(_get_attr(b, "led_heater", "led_header") or "").strip()
-            thr = _get_attr(b, "led_threshould", "led_threshold")
-            try:
-                thr_f = float(thr) if thr is not None else 0.5
-            except Exception:
-                thr_f = 0.5
-
-            key = self._find_obj(heater.lower()) or heater.lower()
+            key = self._find_obj(name) or name
             obj = self.state.get(key, {}) or {}
-
-            field = "power" if "power" in obj else ("temperature" if "temperature" in obj else None)
-            v = obj.get(field) if field else 0.0
             try:
-                v_f = float(v) if v is not None else 0.0
+                spd = float(obj.get("speed") or 0.0)
             except Exception:
-                v_f = 0.0
+                spd = 0.0
+            ok = spd > 0.0
+            return active if ok else inactive
 
-            is_active = v_f > thr_f
-            print(f"[thr] heater {heater} field={field} v={v_f} thr={thr_f} -> active={is_active}", flush=True)
-            return active if is_active else inactive
-
-        # Z_TILT / QGL / BED_MESH
-        if st == "z_tilt":
-            key = self._find_obj("z_tilt") or "z_tilt"
+        if st == "output":
+            name = str(_get_attr(b, "led_output") or "").strip()
+            if not name:
+                return inactive
+            key = self._find_obj(name) or name
             obj = self.state.get(key, {}) or {}
-            applied = bool(obj.get("applied", False))
-            return active if applied else inactive
-
-        if st in ("qgl", "quad_gantry_level"):
-            key = self._find_obj("quad_gantry_level") or "quad_gantry_level"
-            obj = self.state.get(key, {}) or {}
-            applied = bool(obj.get("applied", False))
-            return active if applied else inactive
+            val = obj.get("value", obj.get("state", 0))
+            ok = bool(val)
+            return active if ok else inactive
 
         if st == "bed_mesh":
             key = self._find_obj("bed_mesh") or "bed_mesh"
             obj = self.state.get(key, {}) or {}
-            # heuristics: any non-empty profile_name or mesh
             prof = obj.get("profile_name", "") or ""
             has_mesh = ("mesh_matrix" in obj) or ("probed_matrix" in obj)
             ok = bool(str(prof).strip()) or bool(has_mesh)
@@ -360,28 +269,28 @@ class LedEngine:
         self._set(mcu, bid, desired, reason="revert -> desired(from moonraker/static)")
 
     def on_update(self, changes: Dict[str, Any], eventtime: float) -> None:
-        # merge diffs
-        for obj, fields in (changes or {}).items():
-            if not isinstance(fields, dict):
-                continue
-            if obj not in self.state:
-                self.state[obj] = {}
-            self.state[obj].update(fields)
+        with self._lock:
+            # merge diffs
+            for obj, fields in (changes or {}).items():
+                if not isinstance(fields, dict):
+                    continue
+                if obj not in self.state:
+                    self.state[obj] = {}
+                self.state[obj].update(fields)
 
-        # recompute all dynamic buttons (but DO NOT override busy)
-        for b in self.cfg.buttons.values():
-            st = str(getattr(b, "led_state", "")).lower()
-            if not st or st == "static":
-                continue
+            # recompute all dynamic buttons (but DO NOT override busy)
+            for b in self.cfg.buttons.values():
+                st = str(getattr(b, "led_state", "")).lower()
+                if not st or st == "static":
+                    continue
 
-            key = (b.mcu, int(b.button_id))
-            if key in self._busy_until:
-                # still busy; ignore moonraker update for now
-                continue
+                key = (b.mcu, int(b.button_id))
+                if key in self._busy_until:
+                    continue
 
-            col = self._desired_for_button(b)
-            if col:
-                self._set(b.mcu, int(b.button_id), col, reason=f"dyn {st}")
+                col = self._desired_for_button(b)
+                if col:
+                    self._set(b.mcu, int(b.button_id), col, reason=f"dyn {st}")
 
 
 def main() -> int:
@@ -444,10 +353,12 @@ def main() -> int:
     subscribed = False
     last_info_check = 0.0
     last_sub_attempt = 0.0
+    # 100ms object polling to keep LEDs in sync even if notifications are missed
+    last_objects_poll = 0.0
+    poll_objects: Dict[str, Any] = {}
 
     def on_notify(method: str, params: Any) -> None:
         nonlocal subscribed
-        # we still use polling as the reliable source, but this helps responsiveness
         if method in ("notify_klippy_disconnected", "notify_klippy_shutdown"):
             print(f"[moonraker] {method} -> will re-subscribe when ready", flush=True)
             subscribed = False
@@ -462,7 +373,7 @@ def main() -> int:
 
     ws.set_notify_callback(on_notify)
 
-    # actions worker
+    # action worker: sends gcode / websocket messages on button press
     def action_worker() -> None:
         while not stop["flag"]:
             try:
@@ -472,37 +383,29 @@ def main() -> int:
 
             btns = button_index.get(mcu, {}).get(bid, [])
             for b in btns:
-                # websocket_message
                 msg = getattr(b, "websocket_message", None)
                 if msg:
                     try:
                         payload = msg
                         if isinstance(payload, str):
                             payload = json.loads(payload)
-                        if not isinstance(payload, dict):
-                            raise TypeError("websocket_message must be dict or JSON string -> dict")
-
-                        method = payload.get("method")
-                        params = payload.get("params", None)
-                        if not method:
-                            raise ValueError("websocket_message missing 'method'")
-
-                        # ID random & jsonrpc are handled by ws.call()
-                        if ws.is_connected:
-                            ws.call(method, params=params, timeout=5.0)
-                            print(f"[action] websocket_message sent method={method}", flush=True)
-                        else:
-                            print(f"[action] moonraker offline, skipped websocket_message method={method}", flush=True)
-
+                        if isinstance(payload, dict):
+                            method = payload.get("method")
+                            params = payload.get("params", None)
+                            if method:
+                                if ws.is_connected:
+                                    ws.call(method, params=params, timeout=5.0)
+                                    print(f"[action] ws.call method={method}", flush=True)
+                                else:
+                                    print(f"[action] moonraker offline, skipped ws.call method={method}", flush=True)
                     except Exception as e:
                         print(f"[action] websocket_message failed: {e}", flush=True)
 
-                # gcode
                 gc = getattr(b, "gcode", None)
                 if gc:
                     try:
                         if ws.is_connected:
-                            ws.send_gcode(str(gc), timeout=30.0)
+                            ws.gcode_script(gc, timeout=5.0)
                             print(f"[action] gcode sent: {gc}", flush=True)
                         else:
                             print(f"[action] moonraker offline, skipped gcode: {gc}", flush=True)
@@ -517,7 +420,6 @@ def main() -> int:
 
         btns = button_index.get(mcu_name, {}).get(button_id, [])
         if not btns:
-            # no config => revert immediately to base
             mcu_cfg = cfg.mcus.get(mcu_name)
             base = _norm_color(getattr(mcu_cfg, "color_all", "000000")) if mcu_cfg else "000000"
             bus.colorSingle(mcu_name, button_id, base)
@@ -541,7 +443,6 @@ def main() -> int:
         while not stop["flag"]:
             engine.tick()
 
-            # if websocket down, we can't talk to moonraker
             if not ws.is_connected:
                 subscribed = False
                 time.sleep(0.05)
@@ -562,8 +463,6 @@ def main() -> int:
 
                     if new_state != "ready":
                         subscribed = False
-                    # else ready -> we may subscribe below
-
                 except Exception as e:
                     print(f"[moonraker] server.info failed: {e}", flush=True)
                     subscribed = False
@@ -577,12 +476,12 @@ def main() -> int:
                     engine.set_objects_list(objects)
 
                     sub = build_subscribe_objects(cfg, objects)
+                    poll_objects = sub
                     print(f"[moonraker] subscribing to {len(sub)} objects", flush=True)
 
                     resp = ws.objects_subscribe(sub, timeout=10.0) or {}
                     status = resp.get("status", {}) if isinstance(resp, dict) else {}
                     if isinstance(status, dict) and status:
-                        # apply initial full state like an update
                         engine.on_update(status, 0.0)
 
                     subscribed = True
@@ -591,6 +490,22 @@ def main() -> int:
                 except Exception as e:
                     subscribed = False
                     print(f"[moonraker] subscribe failed: {e}", flush=True)
+
+            # Every 100ms: query current object state and refresh LEDs
+            if subscribed and poll_objects and (now - last_objects_poll) >= 0.1:
+                last_objects_poll = now
+                try:
+                    res = ws.call(
+                        "printer.objects.query",
+                        params={"objects": poll_objects},
+                        timeout=2.0,
+                    ) or {}
+                    status = res.get("status", {}) if isinstance(res, dict) else {}
+                    if isinstance(status, dict) and status:
+                        engine.on_update(status, 0.0)
+                except Exception as e:
+                    if getattr(moon_cfg, "debug", False):
+                        print(f"[moonraker] objects.query failed: {e}", flush=True)
 
             time.sleep(0.02)
 
