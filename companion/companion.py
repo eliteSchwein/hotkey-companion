@@ -400,7 +400,7 @@ def main() -> int:
     button_index = build_button_index(cfg)
 
     # serial bus
-    bus = MultiMcuSerial(press_cb=None, startup_delay=0.6)
+    bus = MultiMcuSerial(press_cb=None, startup_delay=0.3)
     bus.configure_static_from_config(cfg)
     bus.connect(specs)
 
